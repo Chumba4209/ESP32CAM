@@ -1,1 +1,280 @@
+```cpp
+/* ESP32-CAM Send Captured Image to Google Drive with WiFiManager and OLED
+ * Captures images with ESP32-CAM, allows WiFi configuration via WiFiManager,
+ * sends images to Google Drive using a Google Apps Script, and displays status on a 0.96-inch OLED.
+ */
 
+#include <WiFi.h>
+#include <WiFiManager.h> // https://github.com/tzapu/WiFiManager
+#include <HTTPClient.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include "esp_camera.h"
+
+// Camera model (AI Thinker ESP32-CAM)
+#define CAMERA_MODEL_AI_THINKER
+
+#if defined(CAMERA_MODEL_AI_THINKER)
+#define PWDN_GPIO_NUM     32
+#define RESET_GPIO_NUM    -1
+#define XCLK_GPIO_NUM      0
+#define SIOD_GPIO_NUM     26
+#define SIOC_GPIO_NUM     27
+#define Y9_GPIO_NUM       35
+#define Y8_GPIO_NUM       34
+#define Y7_GPIO_NUM       39
+#define Y6_GPIO_NUM       36
+#define Y5_GPIO_NUM       21
+#define Y4_GPIO_NUM       19
+#define Y3_GPIO_NUM       18
+#define Y2_GPIO_NUM        5
+#define VSYNC_GPIO_NUM    25
+#define HREF_GPIO_NUM     23
+#define PCLK_GPIO_NUM     22
+#else
+#error "Camera model not selected"
+#endif
+
+// OLED configuration (0.96-inch SSD1306, 128x64)
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_SDA 15 // GPIO 15 for SDA
+#define OLED_SCL 14 // GPIO 14 for SCL
+#define OLED_RESET -1 // No reset pin
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+// Google Apps Script URL (replace with your script's deployed web app URL)
+#define GOOGLE_SCRIPT_URL "YOUR_GOOGLE_SCRIPT_URL"
+
+// Camera configuration
+static camera_config_t camera_config = {
+    .pin_pwdn = PWDN_GPIO_NUM,
+    .pin_reset = RESET_GPIO_NUM,
+    .pin_xclk = XCLK_GPIO_NUM,
+    .pin_sscb_sda = SIOD_GPIO_NUM,
+    .pin_sscb_scl = SIOC_GPIO_NUM,
+    .pin_d7 = Y9_GPIO_NUM,
+    .pin_d6 = Y8_GPIO_NUM,
+    .pin_d5 = Y7_GPIO_NUM,
+    .pin_d4 = Y6_GPIO_NUM,
+    .pin_d3 = Y5_GPIO_NUM,
+    .pin_d2 = Y4_GPIO_NUM,
+    .pin_d1 = Y3_GPIO_NUM,
+    .pin_d0 = Y2_GPIO_NUM,
+    .pin_vsync = VSYNC_GPIO_NUM,
+    .pin_href = HREF_GPIO_NUM,
+    .pin_pclk = PCLK_GPIO_NUM,
+    .xclk_freq_hz = 20000000,
+    .ledc_timer = LEDC_TIMER_0,
+    .ledc_channel = LEDC_CHANNEL_0,
+    .pixel_format = PIXFORMAT_JPEG,
+    .frame_size = FRAMESIZE_QVGA, // 320x240 to reduce memory usage
+    .jpeg_quality = 15, // Lower quality for smaller images
+    .fb_count = 1,
+    .fb_location = CAMERA_FB_IN_PSRAM,
+    .grab_mode = CAMERA_GRAB_WHEN_EMPTY,
+};
+
+// WiFiManager instance
+WiFiManager wifiManager;
+
+// Function declarations
+bool camera_init(void);
+void camera_deinit(void);
+bool capture_and_upload_image(void);
+String base64_encode(const uint8_t *data, size_t length);
+
+void setup() {
+  Serial.begin(115200);
+  delay(1000); // Ensure Serial initializes
+  Serial.println("ESP32-CAM Image Upload to Google Drive");
+  Serial.println("Inspired by: https://youtu.be/1Lu8FwC2CWQ");
+
+  // Initialize OLED display
+  Wire.begin(OLED_SDA, OLED_SCL);
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("OLED init failed");
+    while (1);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(SSD1306_WHITE);
+  display.setCursor(0, 0);
+  display.println("Initializing...");
+  display.display();
+
+  // Initialize WiFiManager
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("WiFi: Connecting...");
+  display.display();
+  Serial.println("Starting WiFiManager...");
+  wifiManager.setTimeout(180); // 3 minutes timeout for configuration
+  wifiManager.setAPCallback([](WiFiManager *myWiFiManager) {
+    Serial.println("Entered config mode");
+    Serial.printf("AP Name: %s\n", myWiFiManager->getConfigPortalSSID().c_str());
+    Serial.println("AP IP: 192.168.4.1");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Connect to AP:");
+    display.println(myWiFiManager->getConfigPortalSSID());
+    display.println("IP: 192.168.4.1");
+    display.display();
+  });
+
+  // Connect to WiFi or start configuration portal
+  if (!wifiManager.autoConnect("ESP32-CAM-Config")) {
+    Serial.println("Failed to connect and hit timeout");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("WiFi: Failed");
+    display.display();
+    delay(3000);
+    ESP.restart();
+  }
+
+  // WiFi connected
+  Serial.println("WiFi connected");
+  Serial.printf("IP Address: %s\n", WiFi.localIP().toString().c_str());
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("WiFi: Connected");
+  display.println(WiFi.localIP().toString());
+  display.display();
+  delay(2000);
+
+  // Initialize camera
+  if (!camera_init()) {
+    Serial.println("Failed to initialize Camera!");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Camera init failed");
+    display.display();
+    while (1);
+  }
+  Serial.println("Camera initialized");
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Camera OK");
+  display.display();
+
+  Serial.println("\nStarting image capture in 2 seconds...");
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Starting capture...");
+  display.display();
+  delay(2000);
+}
+
+void loop() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.println("Capturing...");
+  display.display();
+
+  // Capture and upload image
+  if (capture_and_upload_image()) {
+    Serial.println("Image uploaded successfully");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Upload OK");
+    display.display();
+  } else {
+    Serial.println("Image upload failed");
+    display.clearDisplay();
+    display.setCursor(0, 0);
+    display.println("Upload Failed");
+    display.display();
+  }
+
+  delay(5000); // Wait 5 seconds before next capture
+}
+
+// Initialize camera
+bool camera_init(void) {
+  esp_err_t err = esp_camera_init(&camera_config);
+  if (err != ESP_OK) {
+    Serial.printf("Camera init failed with error 0x%x\n", err);
+    return false;
+  }
+  sensor_t *s = esp_camera_sensor_get();
+  if (s->id.PID == OV3660_PID) {
+    s->set_vflip(s, 1);
+    s->set_brightness(s, 1);
+    s->set_saturation(s, 0);
+  }
+  return true;
+}
+
+// Deinitialize camera
+void camera_deinit(void) {
+  esp_err_t err = esp_camera_deinit();
+  if (err != ESP_OK) {
+    Serial.println("Camera deinit failed");
+  }
+}
+
+// Capture and upload image to Google Drive
+bool capture_and_upload_image(void) {
+  camera_fb_t *fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("Camera capture failed");
+    return false;
+  }
+
+  // Encode image to base64
+  String base64Image = base64_encode(fb->buf, fb->len);
+  esp_camera_fb_return(fb);
+
+  // Check WiFi connection
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("WiFi disconnected");
+    return false;
+  }
+
+  // Send image to Google Apps Script
+  HTTPClient http;
+  http.begin(GOOGLE_SCRIPT_URL);
+  http.addHeader("Content-Type", "application/x-www-form-urlencoded");
+
+  String postData = "image=" + base64Image;
+  int httpCode = http.POST(postData);
+  bool success = false;
+
+  if (httpCode == HTTP_CODE_OK) {
+    String response = http.getString();
+    if (response == "Success") {
+      success = true;
+    } else {
+      Serial.printf("Upload failed: %s\n", response.c_str());
+    }
+  } else {
+    Serial.printf("HTTP POST failed, code: %d\n", httpCode);
+  }
+
+  http.end();
+  return success;
+}
+
+// Base64 encoding function
+String base64_encode(const uint8_t *data, size_t length) {
+  const char *base64chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  String encoded = "";
+  size_t i = 0;
+  while (i < length) {
+    // Get 3 bytes
+    uint32_t octet_a = i < length ? data[i++] : 0;
+    uint32_t octet_b = i < length ? data[i++] : 0;
+    uint32_t octet_c = i < length ? data[i++] : 0;
+
+    // Convert to 4 base64 characters
+    uint32_t triple = (octet_a << 16) + (octet_b << 8) + octet_c;
+    encoded += base64chars[(triple >> 18) & 63];
+    encoded += base64chars[(triple >> 12) & 63];
+    encoded += (i > length + 1) ? '=' : base64chars[(triple >> 6) & 63];
+    encoded += (i > length) ? '=' : base64chars[triple & 63];
+  }
+  return encoded;
+}
+```
